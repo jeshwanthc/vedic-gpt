@@ -13,8 +13,28 @@ import { getModel } from '../utils/registry'
 import { parseToolCallXml } from './parse-tool-call'
 
 interface ToolExecutionResult {
-  toolCallDataAnnotation: ExtendedCoreMessage | null
+  toolCallDataAnnotations: ExtendedCoreMessage[] | null
   toolCallMessages: CoreMessage[]
+}
+
+async function fetchRAGChunks(query: string): Promise<string[]> {
+  const response = await fetch('https://api.ragie.ai/retrievals', {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      authorization: `Bearer ${process.env.RAGIE_API_KEY}`
+
+    },
+    body: JSON.stringify({ query })
+  });
+
+  if (!response.ok) {
+    throw new Error(`RAG API error: ${response.status} ${response.statusText}`);
+  }
+
+  const json = await response.json();
+  return json.scored_chunks.map((chunk: any) => chunk.text); // Extract only the text field
 }
 
 export async function executeToolCall(
@@ -23,12 +43,10 @@ export async function executeToolCall(
   model: string,
   searchMode: boolean
 ): Promise<ToolExecutionResult> {
-  // If search mode is disabled, return empty tool call
   if (!searchMode) {
-    return { toolCallDataAnnotation: null, toolCallMessages: [] }
+    return { toolCallDataAnnotations: null, toolCallMessages: [] }
   }
 
-  // Convert Zod schema to string representation
   const searchSchemaString = Object.entries(searchSchema.shape)
     .map(([key, value]) => {
       const description = value.description
@@ -38,7 +56,6 @@ export async function executeToolCall(
     .join('\n')
   const defaultMaxResults = model?.includes('ollama') ? 5 : 20
 
-  // Generate tool selection using XML format
   const toolSelectionResponse = await generateText({
     model: getModel(model),
     system: `You are an intelligent assistant that analyzes conversations to select the most appropriate tools and their parameters.
@@ -58,70 +75,122 @@ export async function executeToolCall(
               </parameters>
             </tool_call>
 
-            Available tools: search
+            Available tools: search, vedic_rag (use full for any questions related to vedas and Gita)
 
             Search parameters:
+            ${searchSchemaString}
+
+            Vedic RAG parameters:
             ${searchSchemaString}
 
             If you don't need a tool, respond with <tool_call><tool></tool></tool_call>`,
     messages: coreMessages
   })
 
-  // Parse the tool selection XML using the search schema
+  console.log('Tool selection response: ', toolSelectionResponse)
+
   const toolCall = parseToolCallXml(toolSelectionResponse.text, searchSchema)
 
   if (!toolCall || toolCall.tool === '') {
-    return { toolCallDataAnnotation: null, toolCallMessages: [] }
+    return { toolCallDataAnnotations: null, toolCallMessages: [] }
   }
 
-  const toolCallAnnotation = {
-    type: 'tool_call',
-    data: {
-      state: 'call',
-      toolCallId: `call_${generateId()}`,
-      toolName: toolCall.tool,
-      args: JSON.stringify(toolCall.parameters)
-    }
-  }
-  dataStream.writeData(toolCallAnnotation)
+  const toolCallDataAnnotations: ExtendedCoreMessage[] = []
+  const toolCallMessages: CoreMessage[] = []
 
-  // Support for search tool only for now
-  const searchResults = await search(
-    toolCall.parameters?.query ?? '',
-    toolCall.parameters?.max_results,
-    toolCall.parameters?.search_depth as 'basic' | 'advanced',
-    toolCall.parameters?.include_domains ?? [],
-    toolCall.parameters?.exclude_domains ?? []
-  )
+  // 🔹 VEDIC RAG
+  if (toolCall.tool === 'vedic_rag') {
+    console.log('vedic tool in invoked, ', toolCall)
+    const query = toolCall.parameters?.query ?? ''
+    const ragTexts = await fetchRAGChunks(query)
+    const formattedResponse = ragTexts.map((text, i) => `Chunk ${i + 1}:\n${text}`).join('\n\n')
 
-  const updatedToolCallAnnotation = {
-    ...toolCallAnnotation,
-    data: {
-      ...toolCallAnnotation.data,
-      result: JSON.stringify(searchResults),
-      state: 'result'
-    }
-  }
-  dataStream.writeMessageAnnotation(updatedToolCallAnnotation)
+    console.log('response', formattedResponse)
 
-  const toolCallDataAnnotation: ExtendedCoreMessage = {
-    role: 'data',
-    content: {
+    const toolCallAnnotation = {
       type: 'tool_call',
-      data: updatedToolCallAnnotation.data
-    } as JSONValue
+      data: {
+        state: 'result',
+        toolCallId: `call_${generateId()}`,
+        toolName: 'vedic_rag',
+        args: JSON.stringify(toolCall.parameters),
+        result: JSON.stringify(ragTexts)
+      }
+    }
+
+    dataStream.writeMessageAnnotation(toolCallAnnotation)
+
+    toolCallDataAnnotations.push({
+      role: 'data',
+      content: {
+        type: 'tool_call',
+        data: toolCallAnnotation.data
+      } as JSONValue
+    })
+
+    toolCallMessages.push({
+      role: 'assistant',
+      content: `Vedic RAG result:\n${formattedResponse}`
+    })
   }
 
-  const toolCallMessages: CoreMessage[] = [
-    {
-      role: 'assistant',
-      content: `Tool call result: ${JSON.stringify(searchResults)}`
-    },
-    {
-      role: 'user',
-      content: 'Now answer the user question.'
+  // 🔹 SEARCH TOOL
+  if (toolCall.tool === 'search') {
+    const toolCallAnnotation = {
+      type: 'tool_call',
+      data: {
+        state: 'call',
+        toolCallId: `call_${generateId()}`,
+        toolName: toolCall.tool,
+        args: JSON.stringify(toolCall.parameters)
+      }
     }
-  ]
 
-  return { toolCallDataAnnotation, toolCallMessages }
+    dataStream.writeData(toolCallAnnotation)
+
+    const searchResults = await search(
+      toolCall.parameters?.query ?? '',
+      toolCall.parameters?.max_results,
+      'basic',
+      toolCall.parameters?.include_domains ?? [],
+      toolCall.parameters?.exclude_domains ?? []
+    )
+
+    const updatedToolCallAnnotation = {
+      ...toolCallAnnotation,
+      data: {
+        ...toolCallAnnotation.data,
+        result: JSON.stringify(searchResults),
+        state: 'result'
+      }
+    }
+
+    dataStream.writeMessageAnnotation(updatedToolCallAnnotation)
+
+    toolCallDataAnnotations.push({
+      role: 'data',
+      content: {
+        type: 'tool_call',
+        data: updatedToolCallAnnotation.data
+      } as JSONValue
+    })
+
+    toolCallMessages.push({
+      role: 'assistant',
+      content: `Search tool result: ${JSON.stringify(searchResults)}`
+    })
+  }
+
+  // 🔚 Final message prompting the model to proceed
+  if (toolCallMessages.length > 0) {
+    toolCallMessages.push({
+      role: 'user',
+      content: 'Now answer the user question using the retrieved knowledge.'
+    })
+  }
+
+  return {
+    toolCallDataAnnotations: toolCallDataAnnotations.length > 0 ? toolCallDataAnnotations : null,
+    toolCallMessages
+  }
 }

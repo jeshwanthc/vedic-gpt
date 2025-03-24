@@ -7,12 +7,12 @@ import { cookies } from 'next/headers'
 export const maxDuration = 30
 
 const DEFAULT_MODEL: Model = {
-  id: 'gpt-4o-mini',
-  name: 'GPT-4o mini',
-  provider: 'OpenAI',
-  providerId: 'openai',
-  enabled: true,
-  toolCallType: 'native'
+  "id": "gemini-2.0-flash",
+  "name": "Gemini 2.0 Flash",
+  "provider": "Google Generative AI",
+  "providerId": "google",
+  "enabled": true,
+  "toolCallType": "manual"
 }
 
 export async function POST(req: Request) {
@@ -20,6 +20,8 @@ export async function POST(req: Request) {
     const { messages, id: chatId } = await req.json()
     const referer = req.headers.get('referer')
     const isSharePage = referer?.includes('/share/')
+
+    console.log('message: ', messages)
 
     if (isSharePage) {
       return new Response('Chat API is not available on share pages', {
@@ -33,6 +35,8 @@ export async function POST(req: Request) {
     const searchMode = cookieStore.get('search-mode')?.value === 'true'
 
     let selectedModel = DEFAULT_MODEL
+
+    console.log('selected model: ', selectedModel)
 
     if (modelJson) {
       try {
